@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
 """
 Allen-Bradley PLC Tag Discovery Tool
-Streamlined version with proper tag parsing
+Final, robust version built from direct analysis of PLC debug data.
 """
 
 import sys
 import os
+import logging
 from datetime import datetime
 from pycomm3 import LogixDriver
 import json
+
+# --- Setup logging to a file ---
+log_file = 'discovery_tool.log'
+# Clear previous log file if it exists
+if os.path.exists(log_file):
+    os.remove(log_file)
+    
+logging.basicConfig(
+    filename=log_file,
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+# --------------------------------
 
 class ABTagDiscovery:
     def __init__(self, plc_ip, slot=0):
@@ -19,14 +33,18 @@ class ABTagDiscovery:
         self.plc_info = {}
         
     def connect(self):
-        """Establish connection to the PLC"""
+        """
+        Establish a stable connection to the PLC without pre-loading tags.
+        """
         try:
             print(f"Connecting to PLC at {self.plc_ip}, slot {self.slot}...")
-            self.plc = LogixDriver(self.plc_ip, slot=self.slot)
+            logging.info(f"Attempting connection to {self.plc_ip} on slot {self.slot}")
+            self.plc = LogixDriver(self.plc_ip, slot=self.slot, timeout=5, init_tags=False)
             self.plc.open()
             
             self.plc_info = self.plc.get_plc_info()
             print(f"Connected to: {self.plc_info.get('product_name', 'Unknown PLC')}")
+            logging.info(f"Successfully connected to {self.plc_info.get('product_name')}")
             
             revision = self.plc_info.get('revision', 'Unknown')
             if isinstance(revision, dict):
@@ -37,6 +55,7 @@ class ABTagDiscovery:
             
         except Exception as e:
             print(f"Connection failed: {str(e)}")
+            logging.error(f"Connection failed: {e}", exc_info=True)
             return False
     
     def show_progress(self, current, total, message="Processing"):
@@ -52,162 +71,197 @@ class ABTagDiscovery:
         sys.stdout.flush()
         if current == total:
             print()
-    
+
+    def _parse_structure_def(self, tag_def):
+        """
+        Recursively parses a full tag definition dictionary based on the known structure
+        from the diagnostic data.
+        """
+        # A simple helper to get a consistent string name for a data type
+        def get_type_name(data_type_value):
+            if isinstance(data_type_value, dict):
+                return data_type_value.get('name', 'STRUCT')
+            return str(data_type_value)
+
+        # THE DEFINITIVE FIX: Based on the debug log, the members are located in
+        # the 'internal_tags' dictionary within the 'data_type' dictionary.
+        members_source = None
+        if 'data_type' in tag_def and isinstance(tag_def['data_type'], dict):
+            members_source = tag_def['data_type'].get('internal_tags')
+
+        # If we couldn't find members in the expected place, it's a simple type.
+        if not members_source:
+            logging.debug(f"Parsing as simple type. Definition: {tag_def}")
+            return get_type_name(tag_def.get('data_type', 'Unknown'))
+        
+        # Build the parsed structure
+        structure = {
+            '_data_type_': get_type_name(tag_def.get('data_type', 'UDT')),
+            'members': {}
+        }
+        logging.debug(f"Parsing structure '{structure['_data_type_']}'.")
+
+        for member_name, member_data in members_source.items():
+            if not member_name.startswith('__'):
+                # Recursively parse each member of the structure
+                structure['members'][member_name] = self._parse_structure_def(member_data)
+        
+        return structure
+
     def discover_tags(self):
-        """Discover all tags from the PLC"""
+        """
+        Discovers tags by getting a list of names, then retrieving the full definition
+        for each tag individually for maximum stability.
+        """
         try:
             print("Discovering tags...")
-            tags_raw = self.plc.get_tag_list()
+            logging.info("Starting tag discovery.")
+            initial_tag_list = []
+            failed_scopes = []
+
+            # Get a lightweight list of controller-scoped tag names.
+            print("--> Getting controller-scoped tag list...")
+            try:
+                controller_tags = self.plc.get_tag_list()
+                if controller_tags:
+                    initial_tag_list.extend(controller_tags)
+                    print(f"    Found {len(controller_tags)} controller tags.")
+                    logging.info(f"Found {len(controller_tags)} controller-scoped tags.")
+            except Exception as e:
+                print(f"    WARNING: Could not retrieve controller-scoped tags. Error: {e}")
+                logging.warning("Failed to retrieve controller-scoped tags.", exc_info=True)
+                failed_scopes.append("Controller Scope")
+
+            # Get a lightweight list of program-scoped tag names.
+            print("--> Getting program-scoped tag list...")
+            program_names = []
+            try:
+                programs_tag = self.plc.read('PROGRAM')
+                if programs_tag and programs_tag.value:
+                    program_names = programs_tag.value
+            except Exception as e:
+                 print(f"    WARNING: Could not retrieve program list. Error: {e}")
+                 logging.warning("Failed to retrieve program list.", exc_info=True)
+
+            if program_names:
+                print(f"    Found {len(program_names)} programs.")
+                logging.info(f"Found programs: {program_names}")
+                for prog_name in program_names:
+                    try:
+                        program_tags = self.plc.get_tag_list(program=prog_name)
+                        if program_tags:
+                            for tag in program_tags:
+                                tag['tag_name'] = f"Program:{prog_name}.{tag['tag_name']}"
+                            initial_tag_list.extend(program_tags)
+                            print(f"    + {len(program_tags)} tags from '{prog_name}'.")
+                            logging.info(f"Found {len(program_tags)} tags in program '{prog_name}'.")
+                    except Exception as e:
+                        print(f"    WARNING: Could not retrieve tags for program '{prog_name}'. Error: {e}")
+                        logging.warning(f"Failed to retrieve tags for program '{prog_name}'.", exc_info=True)
+                        failed_scopes.append(f"Program:{prog_name}")
+            else:
+                print("    No programs found.")
+                logging.info("No programs found in PLC.")
             
-            total_tags = len(tags_raw)
-            print(f"Processing {total_tags} tags...")
+            if not initial_tag_list:
+                print("\nERROR: Failed to retrieve any tags from the PLC.")
+                logging.error("No tags could be retrieved from the PLC.")
+                return False
+
+            # Process the list, getting the full definition for each tag one by one.
+            total_tags = len(initial_tag_list)
+            print(f"\nProcessing {total_tags} tags (retrieving full definitions)...")
             
-            for idx, tag in enumerate(tags_raw, 1):
-                tag_name = tag.get('tag_name', '')
-                
-                # Skip system tags
-                if tag_name.startswith('__'):
+            for idx, tag_summary in enumerate(initial_tag_list):
+                tag_name = tag_summary.get('tag_name')
+                if not tag_name or tag_name.startswith('__') or tag_name.startswith('System:'):
                     continue
                 
-                # Parse tag information
-                tag_info = self.parse_tag_info(tag)
-                self.tags[tag_name] = tag_info
-                
-                # Update progress
-                if idx % 10 == 0 or idx == total_tags:
-                    self.show_progress(idx, total_tags, "Processing tags")
+                try:
+                    full_tag_def = self.plc.get_tag_info(tag_name)
+                    logging.debug(f"Full definition for '{tag_name}': {json.dumps(full_tag_def, indent=2, default=str)}")
+                    self.tags[tag_name] = self._parse_structure_def(full_tag_def)
+                except Exception as e:
+                    print(f"\n--> WARNING: Could not get full definition for tag '{tag_name}'. Using summary info. Error: {e}")
+                    logging.warning(f"Could not get full definition for tag '{tag_name}'.", exc_info=True)
+                    self.tags[tag_name] = tag_summary.get('data_type', 'UNKNOWN')
+
+                self.show_progress(idx + 1, total_tags, "Processing definitions")
             
-            print(f"\nDiscovered {len(self.tags)} user tags")
+            print(f"\nSuccessfully processed {len(self.tags)} user tags.")
+            logging.info(f"Finished processing. Found {len(self.tags)} user tags.")
             return True
             
         except Exception as e:
-            print(f"\nTag discovery failed: {str(e)}")
+            print(f"\nAn unexpected error occurred during tag discovery: {str(e)}")
+            logging.error("An unexpected error occurred during tag discovery.", exc_info=True)
+            import traceback
+            traceback.print_exc()
             return False
     
-    def parse_tag_info(self, tag):
-        """Parse tag information into a clean structure"""
-        tag_info = {
-            'data_type': str(tag.get('data_type', 'Unknown')),
-            'members': {}
-        }
-        
-        # Check if tag has internal structure (UDT/AOI)
-        if isinstance(tag, dict):
-            # Handle internal_tags structure
-            if 'internal_tags' in tag:
-                for member_name, member_data in tag.get('internal_tags', {}).items():
-                    # Skip internal/system members
-                    if not member_name.startswith('__'):
-                        tag_info['members'][member_name] = member_data.get('data_type', 'Unknown')
-            
-            # Also check for direct member structure
-            elif 'struct' in tag:
-                for member in tag.get('struct', []):
-                    if isinstance(member, dict):
-                        member_name = member.get('name', '')
-                        if member_name and not member_name.startswith('__'):
-                            tag_info['members'][member_name] = member.get('data_type', 'Unknown')
-        
-        return tag_info
-    
-    def generate_markdown(self, output_file='plc_tags.md'):
-        """Generate clean markdown file"""
+    def generate_report(self, output_file='plc_tags.md'):
+        """
+        Generate a clean markdown report with a flat table of full, expanded tag paths.
+        """
         try:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             base_name = os.path.splitext(output_file)[0]
             
-            # Format revision
             revision = self.plc_info.get('revision', 'N/A')
-            if isinstance(revision, dict):
-                revision_str = f"{revision.get('major', '?')}.{revision.get('minor', '?')}"
-            else:
-                revision_str = str(revision)
-            
-            # Organize tags
-            structured_tags = {}
-            simple_tags = {}
-            
-            for tag_name, tag_info in sorted(self.tags.items()):
-                if tag_info['members']:
-                    structured_tags[tag_name] = tag_info
+            revision_str = f"{revision['major']}.{revision['minor']}" if isinstance(revision, dict) else str(revision)
+
+            flat_tag_list = []
+            def flatten_recursive(tag_name_prefix, tag_info):
+                if isinstance(tag_info, dict) and 'members' in tag_info:
+                    if not tag_info['members']:
+                        data_type = tag_info.get('_data_type_', 'STRUCT')
+                        flat_tag_list.append({'path': tag_name_prefix, 'type': data_type})
+                    else:
+                        for member_name, member_info in sorted(tag_info['members'].items()):
+                            flatten_recursive(f"{tag_name_prefix}.{member_name}", member_info)
                 else:
-                    simple_tags[tag_name] = tag_info
-            
-            # Write markdown file
+                    flat_tag_list.append({'path': tag_name_prefix, 'type': tag_info})
+
+            for tag_name, tag_info in sorted(self.tags.items()):
+                flatten_recursive(tag_name, tag_info)
+
             with open(output_file, 'w', encoding='utf-8') as f:
-                # Header
                 f.write(f"# PLC Tag Report\n\n")
                 f.write(f"**Generated:** {timestamp}\n\n")
                 
-                # PLC Info
                 f.write("## PLC Information\n\n")
                 f.write(f"- **PLC:** {self.plc_info.get('product_name', 'N/A')} (Rev {revision_str})\n")
                 f.write(f"- **IP:** {self.plc_ip} | **Slot:** {self.slot}\n")
-                f.write(f"- **Total Tags:** {len(self.tags)}\n")
-                f.write(f"- **Structured Tags:** {len(structured_tags)}\n")
-                f.write(f"- **Simple Tags:** {len(simple_tags)}\n\n")
+                f.write(f"- **Total User Tags (Top Level):** {len(self.tags)}\n")
+                f.write(f"- **Total Pollable Tag Paths:** {len(flat_tag_list)}\n\n")
                 
-                # Structured Tags (limit to first 20 for readability)
-                if structured_tags:
-                    f.write("## Structured Tags\n\n")
-                    
-                    count = 0
-                    for tag_name, tag_info in sorted(structured_tags.items()):
-                        if count >= 20:  # Limit for file size
-                            f.write(f"\n*... and {len(structured_tags) - 20} more structured tags*\n")
-                            break
-                        
-                        f.write(f"### {tag_name}\n")
-                        f.write(f"**Type:** {tag_info['data_type']}\n\n")
-                        
-                        # Member table
-                        if tag_info['members']:
-                            f.write("| Member | Type |\n")
-                            f.write("|--------|------|\n")
-                            
-                            # Show first 15 members
-                            member_items = sorted(tag_info['members'].items())
-                            for member_name, member_type in member_items[:15]:
-                                f.write(f"| {member_name} | {member_type} |\n")
-                            
-                            if len(member_items) > 15:
-                                f.write(f"| *... +{len(member_items)-15} more* | - |\n")
-                        
-                        f.write("\n")
-                        count += 1
+                f.write("## Tag List\n\n")
+                f.write("This table contains the full tag paths required for SCADA/HMI configuration.\n\n")
+                f.write("| Full Tag Path | Data Type |\n")
+                f.write("|---------------|-----------|\n")
                 
-                # Simple Tags (in a single table)
-                if simple_tags:
-                    f.write("## Simple Tags\n\n")
-                    f.write("| Tag Name | Data Type |\n")
-                    f.write("|----------|----------|\n")
-                    
-                    count = 0
-                    for tag_name, tag_info in sorted(simple_tags.items()):
-                        if count >= 50:  # Limit for file size
-                            f.write(f"| *... +{len(simple_tags)-50} more* | - |\n")
-                            break
-                        f.write(f"| {tag_name} | {tag_info['data_type']} |\n")
-                        count += 1
-                
+                for tag in flat_tag_list:
+                    path_str = tag['path'].replace('|', '\\|')
+                    type_str = str(tag['type']).replace('|', '\\|')
+                    f.write(f"| `{path_str}` | `{type_str}` |\n")
+
                 f.write("\n---\n")
-                f.write(f"*Full tag details saved in: {base_name}_full.json*\n")
+                f.write(f"*Full, nested tag hierarchy saved in: `{base_name}_full.json`*\n")
             
             print(f"\nMarkdown report saved to: {output_file}")
             
-            # Save full JSON
             self.save_json(f"{base_name}_full.json")
-            
             return True
             
         except Exception as e:
-            print(f"\nFailed to generate markdown: {str(e)}")
+            print(f"\nFailed to generate report: {str(e)}")
+            logging.error("Failed to generate report.", exc_info=True)
             import traceback
             traceback.print_exc()
             return False
     
     def save_json(self, json_file):
-        """Save complete tag data to JSON"""
+        """Save complete tag data to a nested JSON file."""
         try:
             output_data = {
                 'scan_info': {
@@ -222,109 +276,115 @@ class ABTagDiscovery:
             with open(json_file, 'w', encoding='utf-8') as f:
                 json.dump(output_data, f, indent=2, default=str)
             
-            print(f"Full tag data saved to: {json_file}")
+            print(f"Full nested tag data saved to: {json_file}")
             return True
             
         except Exception as e:
             print(f"Failed to save JSON: {str(e)}")
+            logging.error(f"Failed to save JSON file '{json_file}'.", exc_info=True)
             return False
     
     def disconnect(self):
         """Close PLC connection"""
-        if self.plc:
+        if self.plc and self.plc.connected:
             self.plc.close()
             print("Disconnected from PLC")
+            logging.info("Disconnected from PLC.")
     
     def run(self, output_file='plc_tags.md'):
         """Execute complete discovery workflow"""
         success = False
-        
         try:
             if not self.connect():
                 return False
-            
             if not self.discover_tags():
                 return False
-            
-            success = self.generate_markdown(output_file)
-            
+            success = self.generate_report(output_file)
         finally:
             self.disconnect()
-        
         return success
 
-
 def get_user_input():
-    """Get configuration from user"""
-    print("=" * 60)
-    print("Allen-Bradley PLC Tag Discovery Tool")
-    print("Streamlined Version")
-    print("=" * 60)
+    """Get configuration from user, with streamlined flow."""
+    print("-" * 60)
     
-    # Get IP
     while True:
-        plc_ip = input("\nEnter PLC IP address: ").strip()
+        plc_ip = input("Enter PLC IP address: ").strip()
         if plc_ip:
             parts = plc_ip.split('.')
             if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
                 break
-            print("Invalid IP address format.")
+            print("Invalid IP address format. Please try again.")
         else:
             print("IP address is required.")
     
-    # Get slot
-    slot_input = input("Enter processor slot [0]: ").strip()
-    if slot_input:
+    while True:
+        slot_input = input("Enter processor slot [default: 0]: ").strip()
+        if not slot_input:
+            slot = 0
+            break
         try:
             slot = int(slot_input)
+            break
         except ValueError:
-            print("Invalid slot. Using default (0).")
-            slot = 0
-    else:
-        slot = 0
-    
-    # Get filename
-    output_file = input("Enter output filename [plc_tags.md]: ").strip()
-    if not output_file:
-        output_file = "plc_tags.md"
-    
-    if not output_file.endswith('.md'):
-        output_file += '.md'
-    
-    return plc_ip, slot, output_file
-
+            print("Invalid slot. Please enter a number.")
+            
+    return plc_ip, slot
 
 def main():
-    """Main execution"""
-    plc_ip, slot, output_file = get_user_input()
-    
-    base_name = os.path.splitext(output_file)[0]
-    
-    print("\n" + "=" * 60)
-    print("Configuration:")
-    print(f"  PLC IP:      {plc_ip}")
-    print(f"  Slot:        {slot}")
-    print(f"  Output:      {output_file}")
-    print(f"  JSON:        {base_name}_full.json")
+    """Main execution loop with improved user experience."""
     print("=" * 60)
-    
-    response = input("\nProceed? (y/n): ").strip().lower()
-    if response != 'y':
-        print("Cancelled")
-        return
-    
-    print()
-    
-    discovery = ABTagDiscovery(plc_ip, slot)
-    
-    if discovery.run(output_file):
-        print("\n✓ Success!")
-        print(f"  Markdown: {os.path.abspath(output_file)}")
-        print(f"  JSON:     {os.path.abspath(base_name + '_full.json')}")
-    else:
-        print("\n✗ Failed - see errors above")
-        sys.exit(1)
+    print("Allen-Bradley PLC Tag Discovery Tool")
+    print(f"(Debug log will be written to: {os.path.abspath(log_file)})")
+    print("=" * 60)
 
+    while True:
+        plc_ip, slot = get_user_input()
+        
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M")
+        output_file = f"{timestamp_str}_plc_tags.md"
+        base_name = os.path.splitext(output_file)[0]
+        
+        print("\n" + "=" * 60)
+        print("Configuration:")
+        print(f"  PLC IP:      {plc_ip}")
+        print(f"  Slot:        {slot}")
+        print(f"  Output File: {output_file}")
+        print(f"  JSON File:   {base_name}_full.json")
+        print("=" * 60)
+        
+        response = input("\nProceed with this configuration? [Y/n]: ").strip().lower()
+        
+        if response == 'n':
+            while True:
+                restart_choice = input("Would you like to (r)estart configuration or (e)xit? ").strip().lower()
+                if restart_choice in ['r', 'e']:
+                    break
+                print("Invalid choice. Please enter 'r' or 'e'.")
+            
+            if restart_choice == 'e':
+                print("Exiting.")
+                return
+            else:
+                print("\nRestarting configuration...\n")
+                continue
+        
+        print()
+        discovery = ABTagDiscovery(plc_ip, slot)
+        
+        if discovery.run(output_file):
+            print("\n✓ Success!")
+            print(f"  Markdown Report: {os.path.abspath(output_file)}")
+            print(f"  JSON Data File:  {os.path.abspath(base_name + '_full.json')}")
+        else:
+            print("\n✗ Failed - see errors above")
+        
+        run_again = input("\nScan another PLC? (y/n): ").strip().lower()
+        if run_again != 'y':
+            print("Exiting.")
+            break
+        print("\n" + "=" * 60)
 
 if __name__ == "__main__":
     main()
+
