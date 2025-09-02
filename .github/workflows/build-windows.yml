@@ -10,10 +10,11 @@ jobs:
     runs-on: windows-latest
     
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v4
     
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
     
@@ -55,20 +56,21 @@ jobs:
         echo "  - Network access to PLC" >> README.txt
         echo "" >> README.txt
         echo "Created by GitHub Actions" >> README.txt
-        echo "Build date: $(date)" >> README.txt
+        echo "Build date: $(Get-Date)" >> README.txt
     
     - name: Upload Windows executable
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: PLC-Toolkit-Windows-${{ github.run_number }}
+        name: PLC-Toolkit-Windows-Build-${{ github.run_number }}
         path: |
           PLC_Toolkit.exe
           Run_Toolkit.bat
           README.txt
+        retention-days: 90
     
     - name: Create Release (if tagged)
       if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: |
           PLC_Toolkit.exe
@@ -76,13 +78,22 @@ jobs:
           README.txt
         name: PLC Toolkit ${{ github.ref_name }}
         body: |
-          Windows executable release of PLC Toolkit
+          # Windows Executable Release
           
-          ## Installation
+          ## 📦 Installation
           1. Download all files
           2. Extract to a folder
           3. Run `Run_Toolkit.bat`
           
-          ## Requirements
+          ## 💻 Requirements
           - Windows 10/11 or Windows Server
           - Network access to Allen-Bradley PLC
+          
+          ## 🚀 Features
+          - Tag discovery and database storage
+          - Export to Excel, JSON, XML
+          - Live tag reading and monitoring
+          - Case-insensitive tag matching
+          
+          ---
+          *No Python installation required!*

@@ -1,0 +1,49 @@
+name: Build Windows EXE (Simple)
+
+on:
+  workflow_dispatch:  # Manual trigger only
+    inputs:
+      version:
+        description: 'Version number (e.g., 1.0.0)'
+        required: false
+        default: '1.0.0'
+
+jobs:
+  build:
+    runs-on: windows-2022  # Use specific Windows version
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+    
+    - name: Install dependencies
+      run: |
+        pip install pyinstaller==6.11.1
+        pip install pycomm3
+        pip install openpyxl
+    
+    - name: Build EXE
+      run: |
+        pyinstaller --onefile --console --clean --name PLC_Toolkit plc_toolkit_consolidated.py
+        
+    - name: Prepare distribution
+      run: |
+        mkdir dist_package
+        copy dist\PLC_Toolkit.exe dist_package\
+        echo @echo off > dist_package\Run_Toolkit.bat
+        echo if not exist plc_scans mkdir plc_scans >> dist_package\Run_Toolkit.bat
+        echo PLC_Toolkit.exe >> dist_package\Run_Toolkit.bat
+        echo if ERRORLEVEL 1 pause >> dist_package\Run_Toolkit.bat
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: PLC-Toolkit-v${{ github.event.inputs.version }}
+        path: dist_package/*
+        retention-days: 30
